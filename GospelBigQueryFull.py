@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import math
 import json
 import openai
 import pandas as pd
@@ -81,6 +82,7 @@ MASTER_TABLE_SCHEMA = [
     # If you want a "date" column to store the ingestion date or sheet date
     bigquery.SchemaField("date", "DATE"),
 ]
+
 
 # -------------------------------------------------------------------
 # HELPER FUNCTIONS
