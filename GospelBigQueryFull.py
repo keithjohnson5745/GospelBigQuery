@@ -3,9 +3,11 @@ import re
 import time
 import math
 import json
-import openai
+from dotenv import load_dotenv
+from openai import OpenAI
 import pandas as pd
 import gspread
+from serpapi import GoogleSearch
 from google.oauth2.service_account import Credentials
 from google.cloud import bigquery
 from googleapiclient.discovery import build
@@ -28,8 +30,15 @@ credentials = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes
 gc = gspread.authorize(credentials)
 drive_service = build("drive", "v3", credentials=credentials)
 
-# If you prefer, set OPENAI_API_KEY in your environment instead of placing it here
-openai.api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+# 1) Load .env
+load_dotenv()  # this will parse the .env file and load environment variables
+
+# 2) Read the API keys from the environment
+api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+SERP_API_KEY = os.getenv("SERP_API_KEY", "YOUR_SERP_API_KEY")
+
+# 3) Instantiate the client
+client = OpenAI(api_key=api_key)
 
 # -------------------------------------------------------------------
 # BIGQUERY CONFIG
@@ -48,13 +57,9 @@ bq_client = bigquery.Client.from_service_account_json(SERVICE_ACCOUNT_FILE)
 # OTHER CONSTANTS
 # -------------------------------------------------------------------
 
-# Google Drive folder ID containing Sheets
-FOLDER_ID = "1JTDdz7v3ohW1CC8AzUBd5xADI9dOAycu"
+FOLDER_ID = "1JTDdz7v3ohW1CC8AzUBd5xADI9dOAycu"    # Google Drive folder ID
+MODIFIED_AFTER = "2024-06-21T00:00:00Z"          # For filtering by modified time
 
-# (Optional) Only fetch sheets modified after this date/time (RFC 3339)
-MODIFIED_AFTER = "2024-06-21T00:00:00Z"
-
-# Categories for classification
 CATEGORIES = [
     "Video Games", "Entertainment", "Education", "Sports", "Technology",
     "Music", "Podcast", "Politics", "Travel", "Automotive",
@@ -62,9 +67,6 @@ CATEGORIES = [
     "Real Estate", "Photography", "Home Improvement", "Finance"
 ]
 
-# -------------------------------------------------------------------
-# MASTER TABLE SCHEMA WITH INT64 FOR NUMERIC FIELDS
-# -------------------------------------------------------------------
 MASTER_TABLE_SCHEMA = [
     bigquery.SchemaField("Channel title", "STRING"),
     bigquery.SchemaField("Brands", "STRING"),
@@ -82,8 +84,8 @@ MASTER_TABLE_SCHEMA = [
     bigquery.SchemaField("30 day views", "INT64"),
     bigquery.SchemaField("30 Day Subs", "INT64"),
     bigquery.SchemaField("Made_for_kids", "STRING"),
-    bigquery.SchemaField("Description", "STRING"),  # if you want channel descriptions
-    bigquery.SchemaField("date", "DATE"),           # if you want ingestion date
+    bigquery.SchemaField("Description", "STRING"),
+    bigquery.SchemaField("date", "DATE"),
 ]
 
 # -------------------------------------------------------------------
@@ -91,13 +93,11 @@ MASTER_TABLE_SCHEMA = [
 # -------------------------------------------------------------------
 
 def create_dataset_if_not_exists(client, dataset_ref):
-    """Create the dataset if it doesn't already exist."""
     dataset = bigquery.Dataset(dataset_ref)
     dataset.location = "US"
     client.create_dataset(dataset, exists_ok=True)
 
 def table_exists(client, dataset_id, table_name):
-    """Check if a BigQuery table exists."""
     try:
         client.get_table(f"{dataset_id}.{table_name}")
         return True
@@ -107,7 +107,7 @@ def table_exists(client, dataset_id, table_name):
 def list_sheets_in_folder_after_date(drive_service, folder_id, modified_after):
     """
     Return a list of (sheet_name, sheet_id, modifiedTime) for Google Sheets
-    in the given folder, filtering by 'modifiedTime > modified_after'.
+    in the folder, filtering by 'modifiedTime > modified_after'.
     """
     query = (
         f"'{folder_id}' in parents "
@@ -120,22 +120,14 @@ def list_sheets_in_folder_after_date(drive_service, folder_id, modified_after):
     return [(f["name"], f["id"], f["modifiedTime"]) for f in files]
 
 def get_processed_sheets():
-    """
-    Returns a set of sheet_ids from the SheetsProcessed table 
-    so we don't re-process the same sheet.
-    """
     main_table_id = f"{DATASET_ID}.{SHEETS_PROCESSED_TABLE}"
     if not table_exists(bq_client, DATASET_ID, SHEETS_PROCESSED_TABLE):
         return set()
-
     query = f"SELECT sheet_id FROM `{main_table_id}`"
     rows = bq_client.query(query).result()
     return {r.sheet_id for r in rows}
 
 def upsert_sheets_processed(sheet_id, sheet_name):
-    """
-    Insert or update a row in SheetsProcessed to mark it as processed.
-    """
     create_dataset_if_not_exists(bq_client, f"{PROJECT_ID}.{DATASET_ID}")
     if not table_exists(bq_client, DATASET_ID, SHEETS_PROCESSED_TABLE):
         schema = [
@@ -150,13 +142,11 @@ def upsert_sheets_processed(sheet_id, sheet_name):
         bq_client.create_table(table_ref)
 
     temp_table_id = f"{DATASET_ID}._staging_sheets_processed_{int(time.time())}"
-
     df = pd.DataFrame([{
         "sheet_id": sheet_id,
         "sheet_name": sheet_name,
         "last_loaded_timestamp": pd.Timestamp.utcnow(),
     }])
-
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     job = bq_client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
     job.result()
@@ -178,10 +168,6 @@ def upsert_sheets_processed(sheet_id, sheet_name):
     bq_client.delete_table(temp_table_id, not_found_ok=True)
 
 def read_sheet_to_dataframe(sheet_id, tab_name="Videos - Raw Data"):
-    """
-    Read all rows from the specified sheet tab into a Pandas DataFrame.
-    Requires gspread and authorized credentials.
-    """
     sh = gc.open_by_key(sheet_id)
     worksheet = sh.worksheet(tab_name)
     data = worksheet.get_all_records()
@@ -189,20 +175,12 @@ def read_sheet_to_dataframe(sheet_id, tab_name="Videos - Raw Data"):
     return df
 
 def clean_and_prepare_dataframe(df, ingestion_date=None):
-    """
-    Convert columns to int/string/date as needed for INT64 schema. 
-    We do round->int for numeric columns. 
-    """
-    # 1) Strip whitespace from column names
     df.columns = [c.strip() for c in df.columns]
-
-    # 2) Rename columns if needed
     rename_map = {
         'Made for kids?': 'Made_for_kids'
     }
     df.rename(columns=rename_map, inplace=True)
 
-    # 3) Convert known numeric columns to integer
     numeric_cols = [
         "Views", 
         "Duration in seconds", 
@@ -213,54 +191,40 @@ def clean_and_prepare_dataframe(df, ingestion_date=None):
     ]
     for col in numeric_cols:
         if col in df.columns:
-            # Convert to float
             df[col] = pd.to_numeric(df[col], errors="coerce")
-            # Round and cast to int
             df[col] = df[col].apply(lambda x: int(round(x)) if pd.notnull(x) else None)
-            # Optionally convert to a nullable Int64 dtype
             df[col] = df[col].astype("Int64")
 
-    # 4) Convert 'Date published' if present
     if "Date published" in df.columns:
         df["Date published"] = pd.to_datetime(df["Date published"], errors="coerce").dt.date
 
-    # 5) Convert everything else to string
-    #    (except numeric/date columns)
     for col in df.columns:
         if col not in numeric_cols and col != "Date published":
             df[col] = df[col].astype(str)
 
-    # 6) Add an ingestion date if not present
     if "date" not in df.columns:
         df["date"] = ingestion_date if ingestion_date else pd.Timestamp.utcnow().date()
 
-    # 7) Keep only columns in MASTER_TABLE_SCHEMA
     master_col_names = {field.name for field in MASTER_TABLE_SCHEMA}
     df = df[[c for c in df.columns if c in master_col_names]]
 
     return df
 
 def upsert_to_master_table(df, project_id, dataset_id, table_name, unique_key_cols=["Channel title", "Video URL"]):
-    """Merge the DataFrame (with int columns) into the Master table (which has INT64 columns)."""
-    # 1) Drop duplicates so each unique key only appears once
     df = df.drop_duplicates(subset=unique_key_cols, keep="last")
-
     create_dataset_if_not_exists(bq_client, f"{project_id}.{dataset_id}")
 
-    # 2) Ensure Master table exists with INT64 schema
     full_table_id = f"{project_id}.{dataset_id}.{table_name}"
     if not table_exists(bq_client, dataset_id, table_name):
         table_ref = bigquery.Table(full_table_id, schema=MASTER_TABLE_SCHEMA)
         bq_client.create_table(table_ref)
         print(f"Created {full_table_id} with provided schema.")
 
-    # 3) Create a temp staging table
     temp_table_id = f"{dataset_id}._staging_{table_name}_{int(time.time())}"
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     job = bq_client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
     job.result()
 
-    # 4) Build MERGE statement
     on_clause = " AND ".join([f"T.`{col}` = S.`{col}`" for col in unique_key_cols if col in df.columns])
     update_cols = [col for col in df.columns if col not in unique_key_cols]
     update_set = ", ".join([f"T.`{col}` = S.`{col}`" for col in update_cols])
@@ -277,18 +241,12 @@ def upsert_to_master_table(df, project_id, dataset_id, table_name, unique_key_co
       INSERT ({insert_cols})
       VALUES ({insert_vals})
     """
-
-    # 5) Execute the MERGE
     bq_client.query(merge_query).result()
     bq_client.delete_table(f"{project_id}.{temp_table_id}", not_found_ok=True)
 
     print(f"Upserted {len(df)} rows into {full_table_id}.")
 
 def identify_uncategorized_channels():
-    """
-    Return a list of channel titles that exist in MasterTable but are missing
-    or not categorized in ChannelDescriptionReference.
-    """
     query = f"""
     SELECT DISTINCT m.`Channel title`
     FROM `{PROJECT_ID}.{DATASET_ID}.{MASTER_TABLE}` m
@@ -302,41 +260,113 @@ def identify_uncategorized_channels():
     results = bq_client.query(query).result()
     return [row[0] for row in results if row[0]]
 
+def fetch_channel_info(channel_name):
+    """
+    Use SerpAPI to find info about the given YouTube channel.
+    """
+    if not SERP_API_KEY or SERP_API_KEY == "YOUR_SERP_API_KEY":
+        print("[WARNING] No valid SERP_API_KEY found.")
+        return ""
+
+    params = {
+        "q": f"{channel_name} YouTube channel",
+        "engine": "google",
+        "location": "United States",
+        "hl": "en",
+        "gl": "us",
+        "api_key": SERP_API_KEY,
+        "num": 5,
+    }
+
+    search = GoogleSearch(params)
+    results = search.get_dict()
+    snippet = ""
+
+    kg = results.get("knowledge_graph")
+    if kg:
+        desc = kg.get("description")
+        if desc:
+            snippet += f"Knowledge Graph Description: {desc}\n"
+
+    if "organic_results" in results:
+        for res in results["organic_results"]:
+            title = res.get("title", "")
+            snippet_text = res.get("snippet", "")
+            link = res.get("link", "")
+            if "youtube.com" in link.lower() or "channel" in title.lower():
+                snippet += f"* {title}: {snippet_text}\n"
+
+    return snippet.strip()
+
 def classify_channels_with_openai(channel_list, batch_size=10):
     """
-    For each channel in the list, request a short description + single
-    category from the known CATEGORIES. This uses GPT-3.5-turbo.
+    For each channel in the list, gather info from SerpAPI + model classification.
     """
     results = []
     for i in range(0, len(channel_list), batch_size):
-        batch = channel_list[i:i+batch_size]
+        batch = channel_list[i : i + batch_size]
         for channel_name in batch:
-            prompt = f"""
-You're given a YouTube channel title, and you must determine:
-1) A brief description of that channel's typical content
-2) Exactly one category from this list:
+            serp_snippet = fetch_channel_info(channel_name)
+            # If you want to debug the SerpAPI snippet:
+            # print(f"[DEBUG] Serp snippet for {channel_name}:\n{serp_snippet}\n")
+
+            user_content = f"""
+We have external info about this YouTube channel:
+
+{serp_snippet or "(No snippet found)"}
+
+Your task:
+1) Provide a short "Description" of the channel's typical content.
+2) Pick exactly one "Category" from this list:
 {', '.join(CATEGORIES)}
 
-Return a JSON object with fields "Description" and "Category".
+Return ONLY valid JSON with this structure:
+{{
+  "Description": "...",
+  "Category": "..."
+}}
 
-Channel title: {channel_name}
+If uncertain, use "Uncategorized" for "Category".
+Channel: {channel_name}
+
+IMPORTANT:
+- No extra text, disclaimers, or code fences.
+- Output must be valid JSON, no markdown or additional text.
 """
-            try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.2
-                )
-                content = response["choices"][0]["message"]["content"]
-                # Attempt to parse JSON
-                parsed = json.loads(content)
-                description = parsed.get("Description", "").strip()
-                category = parsed.get("Category", "").strip()
 
-                # Validate category
+            try:
+                completion = client.chat.completions.create(
+                    model="gpt-4o",  # or "gpt-3.5-turbo", "gpt-4", etc.
+                    messages=[
+                        {
+                            "role": "developer",
+                            "content": "You are a helpful assistant. Output only valid JSON per user request."
+                        },
+                        {
+                            "role": "user",
+                            "content": user_content
+                        }
+                    ],
+                    temperature=0.0
+                )
+
+                content = completion.choices[0].message.content
+
+                # 1) Debug print to see EXACTLY what the model returned:
+                print(f"[DEBUG] Model output for '{channel_name}':\n{content!r}\n---")
+
+                # 2) Parse JSON
+                try:
+                    parsed = json.loads(content)
+                    description = parsed.get("Description", "").strip()
+                    category = parsed.get("Category", "").strip()
+                except json.JSONDecodeError:
+                    # The model didn't return valid JSON
+                    print(f"[ERROR] Invalid JSON from model for '{channel_name}': {content!r}")
+                    description = "Error retrieving description"
+                    category = "Uncategorized"
+
+                # 3) Validate category
                 if category not in CATEGORIES:
                     category = "Uncategorized"
 
@@ -351,22 +381,16 @@ Channel title: {channel_name}
                 "Category": category
             })
 
-        # Simple rate limit buffer
         time.sleep(1)
     return results
 
 def upsert_channel_descriptions(channel_data):
-    """
-    Upserts channel descriptions/categories into ChannelDescriptionReference.
-    """
     if not channel_data:
         print("No channel data to upsert.")
         return
 
-    # Ensure dataset exists
     create_dataset_if_not_exists(bq_client, f"{PROJECT_ID}.{DATASET_ID}")
 
-    # Ensure ChannelDescriptionReference table exists
     full_ref_id = f"{PROJECT_ID}.{DATASET_ID}.{CHANNEL_REF_TABLE}"
     if not table_exists(bq_client, DATASET_ID, CHANNEL_REF_TABLE):
         schema = [
@@ -378,10 +402,8 @@ def upsert_channel_descriptions(channel_data):
         bq_client.create_table(table_ref)
         print(f"Created table {CHANNEL_REF_TABLE}.")
 
-    # Convert list of dicts to DataFrame
     df = pd.DataFrame(channel_data)
 
-    # Stage & merge
     temp_table_id = f"{DATASET_ID}._staging_{CHANNEL_REF_TABLE}_{int(time.time())}"
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     job = bq_client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
@@ -405,10 +427,6 @@ def upsert_channel_descriptions(channel_data):
     print(f"Upserted {len(df)} channels into {CHANNEL_REF_TABLE}.")
 
 def update_master_with_channel_info():
-    """
-    If your MasterTable includes fields for Description and Category,
-    you can copy them from ChannelDescriptionReference into Master.
-    """
     merge_query = f"""
     MERGE `{PROJECT_ID}.{DATASET_ID}.{MASTER_TABLE}` M
     USING `{PROJECT_ID}.{DATASET_ID}.{CHANNEL_REF_TABLE}` C
@@ -421,15 +439,9 @@ def update_master_with_channel_info():
     bq_client.query(merge_query).result()
     print("MasterTable updated with channel categories and descriptions.")
 
-# -------------------------------------------------------------------
-# MAIN LOGIC
-# -------------------------------------------------------------------
-
 def main():
-    # Make sure the dataset exists
     create_dataset_if_not_exists(bq_client, f"{PROJECT_ID}.{DATASET_ID}")
 
-    # 1) Fetch all Sheets in the folder, optionally only after a date
     sheets = list_sheets_in_folder_after_date(drive_service, FOLDER_ID, MODIFIED_AFTER)
     processed = get_processed_sheets()
 
@@ -440,14 +452,12 @@ def main():
 
         print(f"\nProcessing sheet: {sheet_name} ({sheet_id}) ...")
         print(f"Last modified time: {modified_time}")
-
         try:
             df = read_sheet_to_dataframe(sheet_id, tab_name="Videos - Raw Data")
         except Exception as ex:
-            print(f"Failed to read 'Videos - Raw Data' from sheet '{sheet_name}': {ex}")
+            print(f"Failed to read 'Videos - Raw Data' from '{sheet_name}': {ex}")
             continue
 
-        # 2) Clean and prepare the DataFrame
         ingestion_date = pd.Timestamp.utcnow().date()
         df = clean_and_prepare_dataframe(df, ingestion_date=ingestion_date)
 
@@ -455,27 +465,19 @@ def main():
             print(f"No valid data in sheet '{sheet_name}'. Skipping upload.")
             continue
 
-        # 3) Upsert data into Master table
         upsert_to_master_table(df, PROJECT_ID, DATASET_ID, MASTER_TABLE)
-
-        # 4) Mark this sheet as processed
         upsert_sheets_processed(sheet_id, sheet_name)
 
-    # 5) Identify uncategorized channels from Master
     channels_to_classify = identify_uncategorized_channels()
     if channels_to_classify:
         print(f"Found {len(channels_to_classify)} channel(s) needing category assignment.")
-        # 6) Use OpenAI to classify
         channel_data = classify_channels_with_openai(channels_to_classify)
-        # 7) Upsert channel descriptions/categories
         upsert_channel_descriptions(channel_data)
-        # 8) (Optional) Update Master with new info
         update_master_with_channel_info()
     else:
         print("No new channels need classification.")
 
     print("\nAll done!")
-
 
 if __name__ == "__main__":
     main()
