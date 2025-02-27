@@ -28,7 +28,7 @@ credentials = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes
 gc = gspread.authorize(credentials)
 drive_service = build("drive", "v3", credentials=credentials)
 
-# If you prefer, set OPENAI_API_KEY in your environment instead:
+# If you prefer, set OPENAI_API_KEY in your environment instead of placing it here
 openai.api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
 
 # -------------------------------------------------------------------
@@ -51,7 +51,10 @@ bq_client = bigquery.Client.from_service_account_json(SERVICE_ACCOUNT_FILE)
 # Google Drive folder ID containing Sheets
 FOLDER_ID = "1JTDdz7v3ohW1CC8AzUBd5xADI9dOAycu"
 
-# Categories you want the classifier to choose from:
+# (Optional) Only fetch sheets modified after this date/time (RFC 3339)
+MODIFIED_AFTER = "2024-06-21T00:00:00Z"
+
+# Categories for classification
 CATEGORIES = [
     "Video Games", "Entertainment", "Education", "Sports", "Technology",
     "Music", "Podcast", "Politics", "Travel", "Automotive",
@@ -59,30 +62,29 @@ CATEGORIES = [
     "Real Estate", "Photography", "Home Improvement", "Finance"
 ]
 
-# Schema for the MasterTable (adding "Description" if you want to store it):
+# -------------------------------------------------------------------
+# MASTER TABLE SCHEMA WITH INT64 FOR NUMERIC FIELDS
+# -------------------------------------------------------------------
 MASTER_TABLE_SCHEMA = [
     bigquery.SchemaField("Channel title", "STRING"),
     bigquery.SchemaField("Brands", "STRING"),
-    bigquery.SchemaField("Views", "INTEGER"),
+    bigquery.SchemaField("Views", "INT64"),
     bigquery.SchemaField("Video title", "STRING"),
     bigquery.SchemaField("Video URL", "STRING"),
-    bigquery.SchemaField("Duration in seconds", "INTEGER"),
+    bigquery.SchemaField("Duration in seconds", "INT64"),
     bigquery.SchemaField("Country", "STRING"),
     bigquery.SchemaField("Language", "STRING"),
     bigquery.SchemaField("Date published", "DATE"),
     bigquery.SchemaField("Category", "STRING"),
     bigquery.SchemaField("YouTube URL", "STRING"),
-    bigquery.SchemaField("All time views", "INTEGER"),
-    bigquery.SchemaField("All time subs", "INTEGER"),
-    bigquery.SchemaField("30 day views", "INTEGER"),
-    bigquery.SchemaField("30 Day Subs", "INTEGER"),
+    bigquery.SchemaField("All time views", "INT64"),
+    bigquery.SchemaField("All time subs", "INT64"),
+    bigquery.SchemaField("30 day views", "INT64"),
+    bigquery.SchemaField("30 Day Subs", "INT64"),
     bigquery.SchemaField("Made_for_kids", "STRING"),
-    # Optionally add a "Description" column to store channel descriptions directly in Master:
-    bigquery.SchemaField("Description", "STRING"),
-    # If you want a "date" column to store the ingestion date or sheet date
-    bigquery.SchemaField("date", "DATE"),
+    bigquery.SchemaField("Description", "STRING"),  # if you want channel descriptions
+    bigquery.SchemaField("date", "DATE"),           # if you want ingestion date
 ]
-
 
 # -------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -102,12 +104,20 @@ def table_exists(client, dataset_id, table_name):
     except:
         return False
 
-def list_sheets_in_folder(drive_service, folder_id):
-    """Return a list of (sheet_name, sheet_id) for Google Sheets in the folder."""
-    query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+def list_sheets_in_folder_after_date(drive_service, folder_id, modified_after):
+    """
+    Return a list of (sheet_name, sheet_id, modifiedTime) for Google Sheets
+    in the given folder, filtering by 'modifiedTime > modified_after'.
+    """
+    query = (
+        f"'{folder_id}' in parents "
+        f"and mimeType='application/vnd.google-apps.spreadsheet' "
+        f"and trashed=false "
+        f"and modifiedTime > '{modified_after}'"
+    )
+    results = drive_service.files().list(q=query, fields="files(id, name, modifiedTime)").execute()
     files = results.get("files", [])
-    return [(f["name"], f["id"]) for f in files]
+    return [(f["name"], f["id"], f["modifiedTime"]) for f in files]
 
 def get_processed_sheets():
     """
@@ -180,16 +190,19 @@ def read_sheet_to_dataframe(sheet_id, tab_name="Videos - Raw Data"):
 
 def clean_and_prepare_dataframe(df, ingestion_date=None):
     """
-    Convert columns to correct dtypes and ensure that columns match the schema.
-    Add an optional 'date' column if you want to store ingestion date or sheet date.
+    Convert columns to int/string/date as needed for INT64 schema. 
+    We do round->int for numeric columns. 
     """
-    # Rename columns that differ slightly:
+    # 1) Strip whitespace from column names
+    df.columns = [c.strip() for c in df.columns]
+
+    # 2) Rename columns if needed
     rename_map = {
         'Made for kids?': 'Made_for_kids'
     }
     df.rename(columns=rename_map, inplace=True)
 
-    # Convert to numeric where appropriate:
+    # 3) Convert known numeric columns to integer
     numeric_cols = [
         "Views", 
         "Duration in seconds", 
@@ -197,54 +210,57 @@ def clean_and_prepare_dataframe(df, ingestion_date=None):
         "All time subs", 
         "30 day views", 
         "30 Day Subs"
-]
+    ]
     for col in numeric_cols:
         if col in df.columns:
-            # First convert to float if possible
+            # Convert to float
             df[col] = pd.to_numeric(df[col], errors="coerce")
-            # Then round or floor so it becomes an integer
+            # Round and cast to int
             df[col] = df[col].apply(lambda x: int(round(x)) if pd.notnull(x) else None)
+            # Optionally convert to a nullable Int64 dtype
+            df[col] = df[col].astype("Int64")
 
-    # Convert 'Date published' if present
+    # 4) Convert 'Date published' if present
     if "Date published" in df.columns:
         df["Date published"] = pd.to_datetime(df["Date published"], errors="coerce").dt.date
 
-    # Convert everything else to string if not numeric
+    # 5) Convert everything else to string
+    #    (except numeric/date columns)
     for col in df.columns:
         if col not in numeric_cols and col != "Date published":
             df[col] = df[col].astype(str)
 
-    # If you want an ingestion date or sheet date, 
-    # store it in a column named 'date'
+    # 6) Add an ingestion date if not present
     if "date" not in df.columns:
         df["date"] = ingestion_date if ingestion_date else pd.Timestamp.utcnow().date()
 
-    # Make sure we keep only columns that exist in our MASTER_TABLE_SCHEMA by name
+    # 7) Keep only columns in MASTER_TABLE_SCHEMA
     master_col_names = {field.name for field in MASTER_TABLE_SCHEMA}
     df = df[[c for c in df.columns if c in master_col_names]]
 
     return df
 
 def upsert_to_master_table(df, project_id, dataset_id, table_name, unique_key_cols=["Channel title", "Video URL"]):
-    # 1. Drop duplicates so that each unique key only appears once
+    """Merge the DataFrame (with int columns) into the Master table (which has INT64 columns)."""
+    # 1) Drop duplicates so each unique key only appears once
     df = df.drop_duplicates(subset=unique_key_cols, keep="last")
 
     create_dataset_if_not_exists(bq_client, f"{project_id}.{dataset_id}")
 
-    # Make sure Master table exists. If not, create it with MASTER_TABLE_SCHEMA
+    # 2) Ensure Master table exists with INT64 schema
     full_table_id = f"{project_id}.{dataset_id}.{table_name}"
     if not table_exists(bq_client, dataset_id, table_name):
         table_ref = bigquery.Table(full_table_id, schema=MASTER_TABLE_SCHEMA)
         bq_client.create_table(table_ref)
         print(f"Created {full_table_id} with provided schema.")
 
-    # Create a temp staging table
+    # 3) Create a temp staging table
     temp_table_id = f"{dataset_id}._staging_{table_name}_{int(time.time())}"
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     job = bq_client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
     job.result()
 
-    # Build MERGE statement
+    # 4) Build MERGE statement
     on_clause = " AND ".join([f"T.`{col}` = S.`{col}`" for col in unique_key_cols if col in df.columns])
     update_cols = [col for col in df.columns if col not in unique_key_cols]
     update_set = ", ".join([f"T.`{col}` = S.`{col}`" for col in update_cols])
@@ -262,16 +278,16 @@ def upsert_to_master_table(df, project_id, dataset_id, table_name, unique_key_co
       VALUES ({insert_vals})
     """
 
+    # 5) Execute the MERGE
     bq_client.query(merge_query).result()
     bq_client.delete_table(f"{project_id}.{temp_table_id}", not_found_ok=True)
 
     print(f"Upserted {len(df)} rows into {full_table_id}.")
 
-
 def identify_uncategorized_channels():
     """
     Return a list of channel titles that exist in MasterTable but are missing
-    in ChannelDescriptionReference. 
+    or not categorized in ChannelDescriptionReference.
     """
     query = f"""
     SELECT DISTINCT m.`Channel title`
@@ -362,7 +378,7 @@ def upsert_channel_descriptions(channel_data):
         bq_client.create_table(table_ref)
         print(f"Created table {CHANNEL_REF_TABLE}.")
 
-    # Convert list of dicts to DF
+    # Convert list of dicts to DataFrame
     df = pd.DataFrame(channel_data)
 
     # Stage & merge
@@ -388,14 +404,11 @@ def upsert_channel_descriptions(channel_data):
 
     print(f"Upserted {len(df)} channels into {CHANNEL_REF_TABLE}.")
 
-
 def update_master_with_channel_info():
     """
-    Optional step: if your MasterTable includes fields for Description and Category,
-    you can update them from the ChannelDescriptionReference so your Master rows
-    have the channel description/category inline.
+    If your MasterTable includes fields for Description and Category,
+    you can copy them from ChannelDescriptionReference into Master.
     """
-    # Adjust if your Master schema does not contain Description
     merge_query = f"""
     MERGE `{PROJECT_ID}.{DATASET_ID}.{MASTER_TABLE}` M
     USING `{PROJECT_ID}.{DATASET_ID}.{CHANNEL_REF_TABLE}` C
@@ -408,7 +421,6 @@ def update_master_with_channel_info():
     bq_client.query(merge_query).result()
     print("MasterTable updated with channel categories and descriptions.")
 
-
 # -------------------------------------------------------------------
 # MAIN LOGIC
 # -------------------------------------------------------------------
@@ -417,16 +429,18 @@ def main():
     # Make sure the dataset exists
     create_dataset_if_not_exists(bq_client, f"{PROJECT_ID}.{DATASET_ID}")
 
-    # 1) Fetch all sheets in folder
-    sheets = list_sheets_in_folder(drive_service, FOLDER_ID)
+    # 1) Fetch all Sheets in the folder, optionally only after a date
+    sheets = list_sheets_in_folder_after_date(drive_service, FOLDER_ID, MODIFIED_AFTER)
     processed = get_processed_sheets()
 
-    for sheet_name, sheet_id in sheets:
+    for sheet_name, sheet_id, modified_time in sheets:
         if sheet_id in processed:
-            print(f"Sheet '{sheet_name}' ({sheet_id}) has already been processed. Skipping.")
+            print(f"Sheet '{sheet_name}' ({sheet_id}) already processed. Skipping.")
             continue
 
         print(f"\nProcessing sheet: {sheet_name} ({sheet_id}) ...")
+        print(f"Last modified time: {modified_time}")
+
         try:
             df = read_sheet_to_dataframe(sheet_id, tab_name="Videos - Raw Data")
         except Exception as ex:
@@ -434,7 +448,6 @@ def main():
             continue
 
         # 2) Clean and prepare the DataFrame
-        #    Optionally parse a date from sheet name or just use "today"
         ingestion_date = pd.Timestamp.utcnow().date()
         df = clean_and_prepare_dataframe(df, ingestion_date=ingestion_date)
 
@@ -456,7 +469,7 @@ def main():
         channel_data = classify_channels_with_openai(channels_to_classify)
         # 7) Upsert channel descriptions/categories
         upsert_channel_descriptions(channel_data)
-        # 8) (Optional) Update the Master table with new info
+        # 8) (Optional) Update Master with new info
         update_master_with_channel_info()
     else:
         print("No new channels need classification.")
